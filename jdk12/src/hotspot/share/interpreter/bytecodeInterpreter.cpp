@@ -2138,16 +2138,21 @@ run:
 
       CASE(_new): {
         u2 index = Bytes::get_Java_u2(pc+1);
+        // 确保常量池中存放的是已解释的类
         ConstantPool* constants = istate->method()->constants();
         if (!constants->tag_at(index).is_unresolved_klass()) {
           // Make sure klass is initialized and doesn't have a finalizer
           Klass* entry = constants->resolved_klass_at(index);
           InstanceKlass* ik = InstanceKlass::cast(entry);
+          // 确保对象所属类型已经经过初始化阶段
           if (ik->is_initialized() && ik->can_be_fastpath_allocated() ) {
+            // 取对象的长度
             size_t obj_size = ik->size_helper();
             oop result = NULL;
             // If the TLAB isn't pre-zeroed then we'll have to do it
+            // 记录是否需要将对象所有字段设置零值
             bool need_zero = !ZeroTLAB;
+            // 是否在TLAB中分配对象
             if (UseTLAB) {
               result = (oop) THREAD->tlab().allocate(obj_size);
             }
@@ -2161,7 +2166,17 @@ run:
             retry:
               HeapWord* compare_to = *Universe::heap()->top_addr();
               HeapWord* new_top = compare_to + obj_size;
+              // 这里大致的意思是(个人理解): 先从堆中获取到现在的可用的空间地址(大小)
+              // 使用这个大小加上当前对象需要的空间大小 计算出新的空间地址(大小)
+
+              // cmpxchg是x86中的Cas指令,这里是一个C++方法,通过Cas方式分配空间
+              // 并发失败的话, 转到retry中重试直至成功分配为止
+
+              // 判断新的大小是否小于分配后的堆内存的最终大小
               if (new_top <= *Universe::heap()->end_addr()) {
+                // 使用乐观锁指令 使用new_top后面的参数依次和new_top比较
+                // 相等将寄存器(zf)置为1,继续执行
+                // 不相等将new_top的值赋值给后面的参数并且将寄存器置为0
                 if (Atomic::cmpxchg(new_top, Universe::heap()->top_addr(), compare_to) != compare_to) {
                   goto retry;
                 }
@@ -2171,6 +2186,7 @@ run:
 #endif
             if (result != NULL) {
               // Initialize object (if nonzero size and need) and then the header
+              // 如果需要,为对象初始化零值
               if (need_zero ) {
                 HeapWord* to_zero = (HeapWord*) result + sizeof(oopDesc) / oopSize;
                 obj_size -= sizeof(oopDesc) / oopSize;
@@ -2178,6 +2194,7 @@ run:
                   memset(to_zero, 0, obj_size * HeapWordSize);
                 }
               }
+              // 根据是否启用偏向锁, 设置对象头信息
               if (UseBiasedLocking) {
                 result->set_mark(ik->prototype_header());
               } else {
@@ -2186,8 +2203,11 @@ run:
               result->set_klass_gap(0);
               result->set_klass(ik);
               // Must prevent reordering of stores for object initialization
+              // 必须防止对象初始化时存储的重新排序
               // with stores that publish the new object.
+              // 使用发布新对象的存储
               OrderAccess::storestore();
+              // 将对象引入栈内存, 继续执行下一跳指令
               SET_STACK_OBJECT(result, 0);
               UPDATE_PC_AND_TOS_AND_CONTINUE(3, 1);
             }
